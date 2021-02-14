@@ -69,7 +69,7 @@ const (
         bufView[i] = str.charCodeAt(i);
       }
       return buf;
-	}
+    }
 
     function shouldShimWebsockets(url) {
       var parsedURL = new URL(url);
