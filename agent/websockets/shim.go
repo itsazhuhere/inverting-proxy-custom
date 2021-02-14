@@ -37,7 +37,241 @@ import (
 
 const (
 	contentTypeHeader = "Content-Type"
+	shimTemplate      = `
+<!--START_WEBSOCKET_SHIM-->
+<!--
+    This file was served from behind a reverse proxy that does not support websockets.
+
+    The following code snippet has been inserted by the proxy to replace websockets
+    with HTTP requests that will work with this proxy.
+
+    If this snippet insertion is causing issues, then contact the server administrator.
+-->
+<script>
+(function() {
+    if (typeof window.nativeWebSocket !== 'undefined') {
+      // We have already replaced websockets
+      return;
+    }
+    const TEXT = 0;
+    const BASE64 = 1;
+    const RAWBINARY = 2;
+
+    console.log('Replacing native websockets with a shim');
+    window.nativeWebSocket = window.WebSocket;
+    const  location = window.location;
+    const shimUri = location.protocol + '//' + location.host + '/{{.ShimPath}}/';
+
+    function stringToArrayBuffer(str) {
+      var buf = new ArrayBuffer(str.length);
+      var bufView = new Uint8Array(buf);
+      for (var i=0, strLen=str.length; i<strLen; i++) {
+        bufView[i] = str.charCodeAt(i);
+      }
+      return buf;
+	}
+
+    function shouldShimWebsockets(url) {
+      var parsedURL = new URL(url);
+      if (typeof parsedURL.host == 'undefined') {
+        parsedURL.host = location.host;
+      }
+      return (parsedURL.host == location.host);
+    }
+
+    function WebSocketShim(url, protocols) {
+      if (!shouldShimWebsockets(url)) {
+        console.log("Not shimming websockets for " + parsedURL.host + " as it does not match the location of " + location.host);
+        return new window.nativeWebSocket(url, protocols);
+      }
+
+      // We need to reference "this" within nested functions, so we alias it to "self"
+      var self = this;
+
+      this.readyState = WebSocketShim.CONNECTING;
+      function openedHandler(msg) {
+        self.readyState = WebSocketShim.OPEN;
+        if (self.onopen) {
+          self.onopen({ target: self });
+        }
+      }
+      function receiveHandler(resp) {
+        var msgs = JSON.parse(resp);
+        if (self.onmessage) {
+          msgs.forEach(function(msg) {
+            if (Array.isArray(msg)) {              
+              if (self.protocolVersion != TEXT) {
+                for (var i = 0; i < msg.length; i++) {
+                  if (self.protocolVersion === RAWBINARY) {
+                    msg[i] = stringToArrayBuffer(msg[i]);
+                  } else {
+                    msg[i] == atob(msg[i]);
+                  }		
+                }
+              }
+              msg = new Blob(msg);
+            }
+            self.onmessage({ target: self, data: msg });
+          });
+        }
+      }
+      function errorHandler() {
+        if (self.onerror) {
+          self.onerror({ target: self });
+        }
+      }
+      self.xhr = function(action, msg, onsuccess, onexit) {
+        var req = new XMLHttpRequest();
+        req.onreadystatechange = function() {
+          if (req.readyState === 4) {
+            if (req.status === 200) {
+              if (onsuccess) {
+                onsuccess(req.responseText);
+              }
+            } else if (req.status !== 408) {
+              errorHandler();
+            }
+            if (onexit) {
+              onexit();
+            }
+          }
+        };
+        req.open("POST", shimUri + action, true);
+        req.setRequestHeader("X-Websocket-Shim-Version", "1");
+        if (typeof msg !== 'string') {
+          msg = JSON.stringify(msg);
+        }
+        req.send(msg);
+      }
+
+      self.closedHandler = function() {
+        self.readyState = WebSocketShim.CLOSED;
+        if (self.onclose) {
+          self.onclose({ target: self });
+        }
+      }
+
+      self.pendingMessages = [];
+      self.needsConversion = function(msg) {
+        if (typeof msg == 'string') {
+          return false;
+        }
+        if (Array.isArray(msg)) {
+          if (msg.length == 1) {
+            if (typeof msg[0] == 'string') {
+              return false;
+            }
+          }
+        }
+        return true;
+      }
+      self.convertMessagesAndPush = function(msgs) {
+        for (var i = 0; i < msgs.length; i++) {
+          if (self.needsConversion(msgs[i].msg)) {
+            var blob = new Blob([msgs[i].msg]);
+            var reader = new FileReader();
+            reader.addEventListener("loadend", function() {
+            if (self.protocolVersion === TEXT ) {
+              msgs[i].msg = [reader.result];                
+            } else {
+              msgs[i].msg = [btoa(reader.result)];
+            }
+            self.convertMessagesAndPush(msgs);
+            });
+            if (self.protocolVersion === TEXT) {
+              reader.readAsText(blob);              
+            } else {
+              reader.readAsBinaryString(blob);
+            }
+            return;
+          }
+        }
+        self.xhr('data', msgs, null, function() {
+          self.pushing = false;
+          self.push();
+        });
+      }
+      self.push = function() {
+         if (self.pushing) {
+           return;
+         }
+         if (self.pendingMessages.length == 0) {
+           return;
+         }
+         self.pushing = true;
+         var msgs = self.pendingMessages;
+         self.pendingMessages = [];
+         self.convertMessagesAndPush(msgs);
+      }
+
+      function poll() {
+        if (self.readyState != WebSocketShim.OPEN) {
+          return;
+        }
+        self.xhr('poll', {'id': self._sessionID}, receiveHandler, poll);
+      }
+
+      self.xhr('open', url, function(resp) {
+        respJSON = JSON.parse(resp);
+        if (respJSON.v === undefined) {
+            self.protocolVersion = 0;
+        } else {
+            self.protocolVersion = respJSON.v;
+        }
+        self._sessionID = respJSON.id;
+        openedHandler(respJSON.msg);
+        poll();
+      });
+    }
+    WebSocketShim.prototype = {
+      binaryType: "blob",
+      onopen: null,
+      onclose: null,
+      onmessage: null,
+      onerror: null,
+
+      send: function(data) {
+        if (this.readyState != WebSocketShim.OPEN) {
+          throw new Error('WebSocket is not yet opened');
+        }
+        this.pendingMessages.push({'id': this._sessionID, 'msg': data});
+        this.push();
+      },
+      close: function() {
+        if (this.readyState != WebSocketShim.OPEN) {
+          return;
+        }
+        this.readyState = WebSocketShim.CLOSING;
+        this.xhr('close', {'id': this._sessionID}, false, this.closedHandler);
+      },
+    };
+
+    addEventListener: function(type, listener) {
+      if (type === 'message') this.onmessage = listener;
+      else if (type === 'open') this.onopen = listener;
+      else if (type === 'error') this.onerror = listener;
+      return;
+    },
+    removeEventListener: function(type, listener) {
+      if (type === 'message' && this.onmessage === listener) this.onmessage = null;
+      else if (type === 'open' && this.onopen === listener) this.onopen = null;
+      else if (type === 'error' && this.onerror === listener) this.onerror = null;
+      return;
+    }
+
+    WebSocketShim.CONNECTING = 0;
+    WebSocketShim.OPEN = 1;
+    WebSocketShim.CLOSING = 2;
+    WebSocketShim.CLOSED = 3;
+
+    window.WebSocket = WebSocketShim;
+})();
+</script>
+<!--END_WEBSOCKET_SHIM-->
+`
 )
+
+var shimTmpl = template.Must(template.New("client-shim").Parse(shimTemplate))
 
 type shimmedBody struct {
 	reader io.Reader
@@ -52,257 +286,9 @@ func (sb *shimmedBody) Close() error {
 	return sb.closer.Close()
 }
 
+// ShimBody handles websockets using shim template
 func ShimBody(shimPath string) (func(resp *http.Response) error, error) {
-
-	shimTemplate := `
-<!--START_WEBSOCKET_SHIM-->
-<!--
-    This file was served from behind a reverse proxy that does not support websockets.
-
-    The following code snippet has been inserted by the proxy to replace websockets
-    with HTTP requests that will work with this proxy.
-
-    If this snippet insertion is causing issues, then contact the server administrator.
--->
-<script>
-(function() {
-	if (typeof window.nativeWebSocket !== 'undefined') {
-	  // We have already replaced websockets
-	  return;
-	}
-	
-	const TEXT = 0;
-	const BASE64 = 1;
-	const RAWBINARY = 2;
-  
-	console.log('Replacing native websockets with a shim');
-	window.nativeWebSocket = window.WebSocket;
-	const  location = window.location;
-	const shimUri = location.protocol + '//' + location.host + '/websocket-shim/';
-  
-	function ab2str(buf) {
-	  return String.fromCharCode.apply(null, new Uint8Array(buf));
-	}
-  
-	function str2ab(str) {
-	  var buf = new ArrayBuffer(str.length);
-	  var bufView = new Uint8Array(buf);
-	  for (var i=0, strLen=str.length; i<strLen; i++) {
-		bufView[i] = str.charCodeAt(i);
-	  }
-	  return buf;
-	}
-  
-	function shouldShimWebsockets(url) {
-	  var parsedURL = new URL(url);
-	  if (typeof parsedURL.host == 'undefined') {
-		parsedURL.host = location.host;
-	  }
-	  return (parsedURL.host == location.host);
-	}
-  
-	function WebSocketShim(url, protocols) {
-	  if (!shouldShimWebsockets(url)) {
-		console.log("Not shimming websockets for " + parsedURL.host + " as it does not match the location of " + location.host);
-		return new window.nativeWebSocket(url, protocols);
-	  }
-  
-	  // We need to reference "this" within nested functions, so we alias it to "self"
-	  var self = this;
-  
-	  this.readyState = WebSocketShim.CONNECTING;
-	  function openedHandler(msg) {
-		self.readyState = WebSocketShim.OPEN;
-		if (self.onopen) {
-		  self.onopen({ target: self });
-		}
-	  }
-	  function receiveHandler(resp) {
-		var msgs = JSON.parse(resp);
-		if (self.onmessage) {
-		  msgs.forEach(function(msg) {
-			if (Array.isArray(msg)) {
-			  if (self.protocolVersion != TEXT) {
-				for (var i = 0; i < msg.length; i++) {
-				  msg[i] == atob(msg[i]);
-				  if (self.protocolVersion === RAWBINARY) {
-					msg[i] = str2ab(msg[i]);
-				  }
-				}
-			  }             
-			  msg = new Blob(msg);
-			}
-			self.onmessage({ target: self, data: msg });
-		  });
-		}
-	  }
-	  function errorHandler() {
-		if (self.onerror) {
-		  self.onerror({ target: self });
-		}
-	  }
-	  self.xhr = function(action, msg, onsuccess, onexit) {
-		var req = new XMLHttpRequest();
-		req.onreadystatechange = function() {
-		  // The operation is complete.
-		  if (req.readyState === 4) {
-			if (req.status === 200) {
-			  if (onsuccess) {
-				onsuccess(req.responseText);
-			  }
-			} else if (req.status !== 408) {
-			  errorHandler();
-			}
-			if (onexit) {
-			  onexit();
-			}
-		  }
-		};
-		req.open("POST", shimUri + action, true);
-		req.setRequestHeader("X-Websocket-Shim-Version", "1");
-		if (typeof msg !== 'string') {
-		  msg = JSON.stringify(msg);
-		}
-		req.send(msg);
-	  }
-  
-	  self.closedHandler = function() {
-		self.readyState = WebSocketShim.CLOSED;
-		if (self.onclose) {
-		  self.onclose({ target: self });
-		}
-	  }
-  
-	  self.pendingMessages = [];
-	  self.needsConversion = function(msg) {
-		if (typeof msg == 'string') {
-		  return false;
-		}
-		if (Array.isArray(msg)) {
-		  if (msg.length == 1) {
-			if (typeof msg[0] == 'string') {
-			  return false;
-			}
-		  }
-		}
-		return true;
-	  }
-	  self.convertMessagesAndPush = function(msgs) {
-		for (var i = 0; i < msgs.length; i++) {
-		  if (self.needsConversion(msgs[i].msg)) {
-			var blob = new Blob([msgs[i].msg]);
-			var reader = new FileReader();
-			reader.addEventListener("loadend", function() {
-			if (self.protocolVersion != TEXT ) {   
-				console.log("convertMessagesAndPush protocolVersion: " + self.protocolVersion); 
-				msgs[i].msg = [btoa(reader.result)];
-			} else {
-				msgs[i].msg = [reader.result];
-			}
-			self.convertMessagesAndPush(msgs);
-			});
-			if (self.protocolVersion === RAWBINARY) {
-			  reader.readAsBinaryString(blob);
-			} else {
-			  console.log(self.protocolVersion, blob)
-			  reader.readAsText(blob);
-			}
-			return;
-		  }
-		}
-		self.xhr('data', msgs, null, function() {
-		  self.pushing = false;
-		  self.push();
-		});
-	  }
-	  self.push = function() {
-		 if (self.pushing) {
-		   return;
-		 }
-		 if (self.pendingMessages.length == 0) {
-		   return;
-		 }
-		 self.pushing = true;
-		 var msgs = self.pendingMessages;
-		 self.pendingMessages = [];
-		 self.convertMessagesAndPush(msgs);
-	  }
-  
-	  function poll() {
-		if (self.readyState != WebSocketShim.OPEN) {
-		  return;
-		}
-		self.xhr('poll', {'id': self._sessionID}, receiveHandler, poll);
-	  }
-  
-	  self.xhr('open', url, function(resp) {
-		respJSON = JSON.parse(resp);
-		if (respJSON.v === undefined) {
-			self.protocolVersion = 0;
-		} else {
-			self.protocolVersion = respJSON.v;
-		}
-		self._sessionID = respJSON.id;
-		openedHandler(respJSON.msg);
-		poll();
-	  });
-	}
-	WebSocketShim.prototype = {
-	  binaryType: "blob",
-	  onopen: null,
-	  onclose: null,
-	  onmessage: null,
-	  onerror: null,
-  
-	  send: function(data) {
-		if (this.readyState != WebSocketShim.OPEN) {
-		  throw new Error('WebSocket is not yet opened');
-		}
-		this.pendingMessages.push({'id': this._sessionID, 'msg': data});
-		this.push();
-	  },
-	  close: function() {
-		if (this.readyState != WebSocketShim.OPEN) {
-		  return;
-		}
-		this.readyState = WebSocketShim.CLOSING;
-		this.xhr('close', {'id': this._sessionID}, false, this.closedHandler);
-	  },
-  
-	  addEventListener: function(type, listener) {
-		if (type === 'message') this.onmessage = listener;
-		else if (type === 'open') this.onopen = listener;
-		else if (type === 'error') this.onerror = listener;
-		return;
-	  },
-	  removeEventListener: function(type, listener) {
-		if (type === 'message' && this.onmessage === listener) this.onmessage = null;
-		else if (type === 'open' && this.onopen === listener) this.onopen = null;
-		else if (type === 'error' && this.onerror === listener) this.onerror = null;
-		return;
-	  }
-	  
-	};
-	WebSocketShim.CONNECTING = 0;
-	WebSocketShim.OPEN = 1;
-	WebSocketShim.CLOSING = 2;
-	WebSocketShim.CLOSED = 3;
-  
-	window.WebSocket = WebSocketShim;
-  })();
-</script>
-<!--END_WEBSOCKET_SHIM-->
-`
-	contents, err := ioutil.ReadFile("/Users/gogasca/Documents/Development/swe/inverting-proxy/agent/websockets/shim.js")
-	if err != nil {
-		return nil, err
-	}
-	log.Print("Building shimTemplate")
-	shimTemplate = fmt.Sprintf(shimTemplate, string(contents))
-
 	var templateBuf bytes.Buffer
-	var shimTmpl = template.Must(template.New("client-shim").Parse(shimTemplate))
-
 	if err := shimTmpl.Execute(&templateBuf, &struct{ ShimPath string }{ShimPath: shimPath}); err != nil {
 		return nil, err
 	}
