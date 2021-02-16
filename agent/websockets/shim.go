@@ -62,6 +62,7 @@ const (
     const  location = window.location;
     const shimUri = location.protocol + '//' + location.host + '/{{.ShimPath}}/';
 
+	// https://developers.google.com/web/updates/2012/06/How-to-convert-ArrayBuffer-to-and-from-String
     function stringToArrayBuffer(str) {
       var buf = new ArrayBuffer(str.length);
       var bufView = new Uint8Array(buf);
@@ -99,14 +100,14 @@ const (
         var msgs = JSON.parse(resp);
         if (self.onmessage) {
           msgs.forEach(function(msg) {
-            if (Array.isArray(msg)) {              
+            if (Array.isArray(msg)) {
               if (self.protocolVersion != TEXT) {
                 for (var i = 0; i < msg.length; i++) {
                   if (self.protocolVersion === RAWBINARY) {
                     msg[i] = stringToArrayBuffer(msg[i]);
                   } else {
                     msg[i] == atob(msg[i]);
-                  }		
+                  }
                 }
               }
               msg = new Blob(msg);
@@ -172,14 +173,14 @@ const (
             var reader = new FileReader();
             reader.addEventListener("loadend", function() {
             if (self.protocolVersion === TEXT ) {
-              msgs[i].msg = [reader.result];                
+              msgs[i].msg = [reader.result];
             } else {
               msgs[i].msg = [btoa(reader.result)];
             }
             self.convertMessagesAndPush(msgs);
             });
             if (self.protocolVersion === TEXT) {
-              reader.readAsText(blob);              
+              reader.readAsText(blob);
             } else {
               reader.readAsBinaryString(blob);
             }
