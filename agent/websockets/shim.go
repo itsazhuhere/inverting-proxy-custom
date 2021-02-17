@@ -72,6 +72,14 @@ const (
       return buf;
     }
 
+		function arrayBufferToString(buf) {
+			var str = '';
+			for (var i = 0, len = buf.length; i < len; i++) {
+				str = str + String.fromCharCode(buf[i]);
+			}
+			return str;
+		}
+
     function shouldShimWebsockets(url) {
       var parsedURL = new URL(url);
       if (typeof parsedURL.host == 'undefined') {
@@ -175,7 +183,15 @@ const (
             if (self.protocolVersion === TEXT ) {
               msgs[i].msg = [reader.result];
             } else {
-              msgs[i].msg = [btoa(reader.result)];
+							try {
+								msgs[i].msg = arrayBufferToString(msgs[i].msg);
+								msgs[i].msg = [btoa(reader.result)];
+							} catch (e) {
+								console.log('Error in shim while converting message');
+								console.log(msgs[i].msg);
+								console.log(e);
+								msgs[i].msg = [reader.result];
+							}
             }
             self.convertMessagesAndPush(msgs);
             });
